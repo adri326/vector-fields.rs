@@ -1,8 +1,11 @@
+use image::RgbaImage;
 use tetra::{Context, ContextBuilder, State};
-use tetra::graphics::{self, Canvas, Color, DrawParams, Shader};
+use tetra::graphics::{self, Canvas, Color, DrawParams, Shader, ImageData};
 use tetra::graphics::mesh::{Mesh, GeometryBuilder, ShapeStyle};
 use tetra::math::Vec2;
 use rand::prelude::*;
+use std::sync::mpsc::{Receiver, Sender, self};
+use std::thread;
 
 const SCALE: f32 = 7.0;
 const DX: f32 = -3.75;
@@ -78,10 +81,12 @@ struct VectorFieldState {
     canvas_bloom: Canvas,
     shader_blur: Shader,
     shader_bloom: Shader,
+
+    image_tx: Sender<ImageData>,
 }
 
 impl VectorFieldState {
-    fn new(ctx: &mut Context) -> Self {
+    fn new(ctx: &mut Context, image_tx: Sender<ImageData>) -> Self {
         Self {
             particles: (0..10000).map(|_| Particle::random()).collect(),
             circle: None,
@@ -91,11 +96,12 @@ impl VectorFieldState {
             canvas_bloom: Canvas::new(ctx, 1080, 1080).unwrap(),
             shader_blur: Shader::from_fragment_file(ctx, "shader/blur.frag").unwrap(),
             shader_bloom: Shader::from_fragment_file(ctx, "shader/bloom.frag").unwrap(),
+
+            image_tx,
         }
     }
 
     fn update_particles(&mut self) {
-        self.t += 1;
         for particle in self.particles.iter_mut() {
             particle.updated = true;
             particle.age += 1.0;
@@ -116,12 +122,13 @@ impl VectorFieldState {
 
 impl State for VectorFieldState {
     fn update(&mut self, _ctx: &mut Context) -> tetra::Result {
-        self.update_particles();
 
         Ok(())
     }
 
     fn draw(&mut self, ctx: &mut Context) -> tetra::Result {
+        self.update_particles();
+        self.t += 1;
         if self.circle.is_none() {
             self.circle = Some(Mesh::circle(ctx, ShapeStyle::Fill, Vec2::new(0.0, 0.0), POINT_SIZE)?);
         }
@@ -133,7 +140,7 @@ impl State for VectorFieldState {
         graphics::set_blend_mode(ctx, graphics::BlendMode::Alpha(graphics::BlendAlphaMode::Multiply));
         self.canvas.draw(ctx, Vec2::zero());
         graphics::set_canvas(ctx, &self.canvas);
-        if (self.t < 10) {
+        if self.t <= 1 {
             graphics::clear(ctx, background);
         }
         let mut background_params: DrawParams = Vec2::new(0.0, 0.0).into();
@@ -187,17 +194,36 @@ impl State for VectorFieldState {
         self.canvas_bloom.draw(ctx, Vec2::zero());
 
         graphics::reset_canvas(ctx);
+        graphics::set_canvas(ctx, &self.canvas_bloom);
         self.shader_blur.set_uniform(ctx, "u_horizontal", 0);
         self.canvas_blur.draw(ctx, Vec2::zero());
 
         graphics::reset_shader(ctx);
         graphics::set_blend_mode(ctx, graphics::BlendMode::Add(graphics::BlendAlphaMode::Multiply));
         self.canvas.draw(ctx, Vec2::zero());
+        graphics::reset_canvas(ctx);
+        graphics::set_blend_mode(ctx, graphics::BlendMode::Alpha(graphics::BlendAlphaMode::Multiply));
+        self.canvas_bloom.draw(ctx, Vec2::zero());
+
+        let image_data = self.canvas_bloom.get_data(ctx);
+        self.image_tx.send(image_data).unwrap();
 
         Ok(())
     }
 }
 
 fn main() -> tetra::Result {
-    ContextBuilder::new("Vector Fields", 1080, 1080).build()?.run(|ctx| Ok(VectorFieldState::new(ctx)))
+    let (tx, rx): (Sender<ImageData>, Receiver<ImageData>) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut n: usize = 0;
+        for image_data in rx {
+            n += 1;
+            let width = image_data.width() as u32;
+            let height = image_data.height() as u32;
+            let buffer: RgbaImage = RgbaImage::from_raw(width, height, image_data.into_bytes()).unwrap();
+            buffer.save(format!("output/{}.png", n));
+        }
+    });
+    ContextBuilder::new("Vector Fields", 1080, 1080).build()?.run(|ctx| Ok(VectorFieldState::new(ctx, tx)))
 }

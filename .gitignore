@@ -1,1 +1,4 @@
 /target
+crossfade.sh
+output/
+*.mp4

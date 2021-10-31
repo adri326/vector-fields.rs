@@ -3,32 +3,37 @@ use tetra::{Context, ContextBuilder, State};
 use tetra::graphics::{self, Canvas, Color, DrawParams, Shader, ImageData};
 use tetra::graphics::mesh::{Mesh, GeometryBuilder, ShapeStyle};
 use tetra::math::Vec2;
-use rand::prelude::*;
+// use rand::prelude::*;
 use std::sync::mpsc::{Receiver, Sender, self};
 use std::thread;
 
-const SCALE: f32 = 7.0;
+const SCALE: f32 = 5.0;
 const DX: f32 = -3.75;
 const DY: f32 = 0.0;
 
-const POINT_LIFETIME: f32 = 25.0;
 const PARTICLE_LIFETIME: f32 = 160.0;
-const POINT_RANDOMNESS: f32 = 0.01;
 const EPSILON: f32 = 0.01;
 const SUBSTEPS: usize = 6;
-const POINT_SIZE: f32 = 1.0;
 const NOISE: f32 = 0.5;
-const PARTICLE_FADE_IN: f32 = 20.0;
+const PARTICLE_FADE_IN: f32 = 40.0;
+const PARTICLE_FADE_OUT: f32 = 40.0;
+const N_PARTICLES: usize = 240000;
+
+const POINT_SIZE: f32 = 0.5;
+const WIDTH: u32 = 1920 * 1;
+const HEIGHT: u32 = 1080 * 1;
+const SAVING: bool = true;
 
 type Complex = num::complex::Complex<f32>;
 
-fn f(t: usize, mut x: Complex) -> Complex {
+fn f(_t: usize, mut x: Complex) -> Complex {
     for i in 2..12 {
         x += x.powi(i) * Complex::new(-i as f32, 0.0).exp();
     }
     x
 }
 
+#[allow(dead_code)]
 fn noise() -> Complex {
     Complex::new(
         (rand::random::<f32>() * 2.0 - 1.0) * NOISE,
@@ -52,8 +57,12 @@ fn sigmoid(x: f32) -> f32 {
 impl Particle {
     fn new(position: Complex) -> Self {
         let p = f(0, position);
+        let mut color = Color::rgb(0.8 + 0.2 * rand::random::<f32>() * sigmoid(p.norm()), 0.45 + 0.2 * rand::random::<f32>() * sigmoid(-p.im), 0.23);
+        if rand::random::<f32>() < 0.3 {
+            color = Color::rgb(0.08, 0.085, 0.12);
+        }
         Self {
-            color: Color::rgb(0.8 + 0.2 * rand::random::<f32>() * sigmoid(p.norm()), 0.45 + 0.2 * rand::random::<f32>() * sigmoid(-p.im), 0.23),
+            color,
             old_position: position.clone(),
             position,
             lifetime: rand::random::<f32>() * PARTICLE_LIFETIME,
@@ -64,8 +73,8 @@ impl Particle {
 
     fn random() -> Self {
         Self::new(Complex::new(
-            (rand::random::<f32>() * 3.0 - 1.5) * SCALE + DX,
-            (rand::random::<f32>() * 3.0 - 1.5) * SCALE + DY
+            (rand::random::<f32>() * 3.0 - 1.5) * SCALE * WIDTH.max(HEIGHT) as f32 / WIDTH as f32 + DX,
+            (rand::random::<f32>() * 3.0 - 1.5) * SCALE * WIDTH.max(HEIGHT) as f32 / HEIGHT as f32 + DY
         ))
     }
 }
@@ -88,12 +97,12 @@ struct VectorFieldState {
 impl VectorFieldState {
     fn new(ctx: &mut Context, image_tx: Sender<ImageData>) -> Self {
         Self {
-            particles: (0..10000).map(|_| Particle::random()).collect(),
+            particles: (0..N_PARTICLES).map(|_| Particle::random()).collect(),
             circle: None,
             t: 0,
-            canvas: Canvas::new(ctx, 1080, 1080).unwrap(),
-            canvas_blur: Canvas::new(ctx, 1080, 1080).unwrap(),
-            canvas_bloom: Canvas::new(ctx, 1080, 1080).unwrap(),
+            canvas: Canvas::new(ctx, WIDTH as i32, HEIGHT as i32).unwrap(),
+            canvas_blur: Canvas::new(ctx, WIDTH as i32, HEIGHT as i32).unwrap(),
+            canvas_bloom: Canvas::new(ctx, WIDTH as i32, HEIGHT as i32).unwrap(),
             shader_blur: Shader::from_fragment_file(ctx, "shader/blur.frag").unwrap(),
             shader_bloom: Shader::from_fragment_file(ctx, "shader/bloom.frag").unwrap(),
 
@@ -136,6 +145,9 @@ impl State for VectorFieldState {
         let background = Color::rgb(0.08, 0.085, 0.12);
         let width = tetra::window::get_width(ctx);
         let height = tetra::window::get_height(ctx);
+        let wh = width.min(height);
+        let dx = (width - wh) as f32 / 2.0;
+        let dy = (height - wh) as f32 / 2.0;
 
         graphics::set_blend_mode(ctx, graphics::BlendMode::Alpha(graphics::BlendAlphaMode::Multiply));
         self.canvas.draw(ctx, Vec2::zero());
@@ -154,22 +166,22 @@ impl State for VectorFieldState {
             if !particle.updated {
                 continue;
             }
-            let x = ((particle.position.re - DX) / SCALE / 2.0 + 0.5) * width as f32;
-            let y = ((particle.position.im - DY) / SCALE / 2.0 + 0.5) * height as f32;
-            let old_x = ((particle.old_position.re - DX) / SCALE / 2.0 + 0.5) * width as f32;
-            let old_y = ((particle.old_position.im - DY) / SCALE / 2.0 + 0.5) * height as f32;
+            let x = ((particle.position.re - DX) / SCALE / 2.0 + 0.5) * wh as f32 + dx;
+            let y = ((particle.position.im - DY) / SCALE / 2.0 + 0.5) * wh as f32 + dy;
+            let old_x = ((particle.old_position.re - DX) / SCALE / 2.0 + 0.5) * wh as f32 + dx;
+            let old_y = ((particle.old_position.im - DY) / SCALE / 2.0 + 0.5) * wh as f32 + dy;
             particle.old_position = particle.position;
 
             let mut params: DrawParams = Vec2::new(x, y).into();
-            let s = sigmoid(particle.age / PARTICLE_FADE_IN);
-            params.color = particle.color * s + background * (1.0 - s);
-            circle.draw(ctx, params.clone());
-            params.position = Vec2::new(old_x, old_y);
-            circle.draw(ctx, params);
+            let s = sigmoid(particle.age / PARTICLE_FADE_IN) * sigmoid((particle.lifetime - particle.age) / PARTICLE_FADE_OUT);
+            // params.color = particle.color.with_alpha(s);
+            // circle.draw(ctx, params.clone());
+            // params.position = Vec2::new(old_x, old_y);
+            // circle.draw(ctx, params);
 
             let line = [Vec2::new(x, y), Vec2::new(old_x, old_y)];
 
-            builder.set_color(particle.color * s + background * (1.0 - s));
+            builder.set_color(particle.color.with_alpha(s));
             builder.polyline(POINT_SIZE * 2.0, &line)?;
         }
 
@@ -180,7 +192,7 @@ impl State for VectorFieldState {
 
         // Bloom filter, using only 3 frag shaders
         graphics::set_shader(ctx, &self.shader_bloom);
-        self.shader_bloom.set_uniform(ctx, "u_threshold", 0.4);
+        self.shader_bloom.set_uniform(ctx, "u_threshold", 0.3);
         graphics::set_canvas(ctx, &self.canvas_bloom);
 
         self.canvas.draw(ctx, Vec2::zero());
@@ -190,6 +202,7 @@ impl State for VectorFieldState {
 
         graphics::set_canvas(ctx, &self.canvas_blur);
         graphics::set_shader(ctx, &self.shader_blur);
+        self.shader_blur.set_uniform(ctx, "u_stepsize", Vec2::new(1.0 / WIDTH as f32, 1.0 / HEIGHT as f32));
         self.shader_blur.set_uniform(ctx, "u_horizontal", 1);
         self.canvas_bloom.draw(ctx, Vec2::zero());
 
@@ -222,8 +235,10 @@ fn main() -> tetra::Result {
             let width = image_data.width() as u32;
             let height = image_data.height() as u32;
             let buffer: RgbaImage = RgbaImage::from_raw(width, height, image_data.into_bytes()).unwrap();
-            buffer.save(format!("output/{}.png", n));
+            if SAVING {
+                buffer.save(format!("output/{}.png", n)).unwrap();
+            }
         }
     });
-    ContextBuilder::new("Vector Fields", 1080, 1080).build()?.run(|ctx| Ok(VectorFieldState::new(ctx, tx)))
+    ContextBuilder::new("Vector Fields", WIDTH as i32, HEIGHT as i32).build()?.run(|ctx| Ok(VectorFieldState::new(ctx, tx)))
 }

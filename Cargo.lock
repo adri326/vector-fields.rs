@@ -996,6 +996,7 @@ dependencies = [
  "image",
  "num",
  "rand",
+ "scoped_threadpool",
  "tetra",
 ]
 

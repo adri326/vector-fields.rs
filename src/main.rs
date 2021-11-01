@@ -3,8 +3,9 @@ use tetra::{Context, ContextBuilder, State};
 use tetra::graphics::{self, Canvas, Color, DrawParams, Shader, ImageData};
 use tetra::graphics::mesh::{Mesh, GeometryBuilder, ShapeStyle};
 use tetra::math::Vec2;
-// use rand::prelude::*;
+use scoped_threadpool::Pool;
 use std::sync::mpsc::{Receiver, Sender, self};
+use std::sync::Mutex;
 use std::thread;
 
 const SCALE: f32 = 5.0;
@@ -17,12 +18,14 @@ const SUBSTEPS: usize = 6;
 const NOISE: f32 = 0.5;
 const PARTICLE_FADE_IN: f32 = 40.0;
 const PARTICLE_FADE_OUT: f32 = 40.0;
-const N_PARTICLES: usize = 240000;
+const N_PARTICLES: usize = 1200000;
 
 const POINT_SIZE: f32 = 0.5;
 const WIDTH: u32 = 1920 * 1;
 const HEIGHT: u32 = 1080 * 1;
 const SAVING: bool = true;
+const THREADS: u32 = 16;
+const TASK_SIZE: usize = 1000;
 
 type Complex = num::complex::Complex<f32>;
 
@@ -41,6 +44,7 @@ fn noise() -> Complex {
     )
 }
 
+#[derive(Clone, Copy, Debug)]
 struct Particle {
     color: Color,
     position: Complex,
@@ -111,21 +115,69 @@ impl VectorFieldState {
     }
 
     fn update_particles(&mut self) {
-        for particle in self.particles.iter_mut() {
-            particle.updated = true;
-            particle.age += 1.0;
+        let mut pool = Pool::new(THREADS);
 
-            for _ in 0..SUBSTEPS {
-                let mut z = f(self.t, particle.position);
-                z = z / z.norm(); // + noise();
-                particle.position += z * (EPSILON / SUBSTEPS as f32);
-            }
+        let res: Vec<Particle> = Vec::with_capacity(self.particles.len());
+        let res = Mutex::new(res);
 
-            let d = f(self.t, particle.position).norm_sqr();
-            if particle.age >= particle.lifetime || d > 4.0 * SCALE * SCALE || d.is_nan() {
-                *particle = Particle::random();
+        pool.scoped(|scope| {
+            let res = &res;
+            let particles = &self.particles;
+            for n in 0..(particles.len() / TASK_SIZE) {
+                let t = self.t;
+                scope.execute(move || { // move task_buffer
+                    let n = n * TASK_SIZE;
+                    let mut task_buffer = Vec::with_capacity(TASK_SIZE);
+                    for o in n..(n+TASK_SIZE) {
+                        if o >= particles.len() {
+                            break;
+                        }
+                        let mut particle = particles[o].clone();
+
+                        particle.updated = true;
+                        particle.age += 1.0;
+
+                        for _ in 0..SUBSTEPS {
+                            let mut z = f(t, particle.position);
+                            z = z / z.norm(); // + noise();
+                            particle.position += z * (EPSILON / SUBSTEPS as f32);
+                        }
+
+                        let d = f(t, particle.position).norm_sqr();
+                        if particle.age >= particle.lifetime || d > 4.0 * SCALE * SCALE || d.is_nan() {
+                            particle = Particle::random();
+                        }
+                        task_buffer.push(particle);
+                    }
+
+                    match res.lock() {
+                        Ok(mut lock) => {
+                            lock.append(&mut task_buffer);
+                        },
+                        Err(err) => panic!("Couldn't lock result buffer! {}", err),
+                    }
+                });
             }
-        }
+        });
+
+        let res = res.into_inner().unwrap();
+        self.particles = res;
+
+        // for particle in self.particles.iter_mut() {
+        //     particle.updated = true;
+        //     particle.age += 1.0;
+
+        //     for _ in 0..SUBSTEPS {
+        //         let mut z = f(self.t, particle.position);
+        //         z = z / z.norm(); // + noise();
+        //         particle.position += z * (EPSILON / SUBSTEPS as f32);
+        //     }
+
+        //     let d = f(self.t, particle.position).norm_sqr();
+        //     if particle.age >= particle.lifetime || d > 4.0 * SCALE * SCALE || d.is_nan() {
+        //         *particle = Particle::random();
+        //     }
+        // }
     }
 }
 
@@ -156,7 +208,7 @@ impl State for VectorFieldState {
             graphics::clear(ctx, background);
         }
         let mut background_params: DrawParams = Vec2::new(0.0, 0.0).into();
-        background_params.color = background.with_alpha(0.1);
+        background_params.color = background.with_alpha(0.07);
         Mesh::rectangle(ctx, ShapeStyle::Fill, graphics::Rectangle::new(0.0, 0.0, width as f32, height as f32))?
             .draw(ctx, background_params);
 

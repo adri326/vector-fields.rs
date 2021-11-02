@@ -1,4 +1,5 @@
 use image::RgbaImage;
+use rand::prelude::*;
 use tetra::{Context, ContextBuilder, State};
 use tetra::graphics::{self, Canvas, Color, DrawParams, Shader, ImageData};
 use tetra::graphics::mesh::{Mesh, GeometryBuilder, ShapeStyle};
@@ -16,9 +17,9 @@ const PARTICLE_LIFETIME: f32 = 160.0;
 const EPSILON: f32 = 0.01;
 const SUBSTEPS: usize = 6;
 const NOISE: f32 = 0.5;
-const PARTICLE_FADE_IN: f32 = 40.0;
-const PARTICLE_FADE_OUT: f32 = 40.0;
-const N_PARTICLES: usize = 1200000;
+const PARTICLE_FADE_IN: f32 = 6.0;
+const PARTICLE_FADE_OUT: f32 = 6.0;
+const N_PARTICLES: usize = 100000;
 
 const POINT_SIZE: f32 = 0.5;
 const WIDTH: u32 = 1920 * 1;
@@ -26,6 +27,9 @@ const HEIGHT: u32 = 1080 * 1;
 const SAVING: bool = true;
 const THREADS: u32 = 16;
 const TASK_SIZE: usize = 1000;
+
+const LOOP_FRAMES: u32 = 1; // Set to 1 for infinite animation, set to some other value for a looping animation
+const PARTICLES_PER_FRAME: u32 = 10000;
 
 type Complex = num::complex::Complex<f32>;
 
@@ -65,21 +69,42 @@ impl Particle {
         if rand::random::<f32>() < 0.3 {
             color = Color::rgb(0.08, 0.085, 0.12);
         }
+        // let lifetime = LOOP_FRAMES as f32 / (if rand::random::<f32>() < 0.3 {4.0f32} else {8.0f32}).ceil();
+        let lifetime = rand::random::<f32>() * PARTICLE_LIFETIME;
         Self {
             color,
             old_position: position.clone(),
             position,
-            lifetime: rand::random::<f32>() * PARTICLE_LIFETIME,
-            age: 0.0,
+            lifetime,
+            age: rand::random::<f32>() * lifetime,
             updated: false,
         }
     }
 
-    fn random() -> Self {
-        Self::new(Complex::new(
-            (rand::random::<f32>() * 3.0 - 1.5) * SCALE * WIDTH.max(HEIGHT) as f32 / WIDTH as f32 + DX,
-            (rand::random::<f32>() * 3.0 - 1.5) * SCALE * WIDTH.max(HEIGHT) as f32 / HEIGHT as f32 + DY
-        ))
+    fn random(mut t: u32, n: u32) -> Self {
+        if LOOP_FRAMES > 1 {
+            t %= LOOP_FRAMES;
+        }
+        let seed: u64 = ((t as u64) << 32) | n as u64;
+        let mut r = rand::rngs::StdRng::seed_from_u64(seed);
+        let position = Complex::new(
+            (r.gen::<f32>() * 3.0 - 1.5) * SCALE * WIDTH.max(HEIGHT) as f32 / WIDTH as f32 + DX,
+            (r.gen::<f32>() * 3.0 - 1.5) * SCALE * WIDTH.max(HEIGHT) as f32 / HEIGHT as f32 + DY
+        );
+        let p = f(t as usize, position);
+        let mut color = Color::rgb(0.8 + 0.2 * r.gen::<f32>() * sigmoid(p.norm()), 0.45 + 0.2 * r.gen::<f32>() * sigmoid(-p.im), 0.23);
+        if r.gen::<f32>() < 0.3 {
+            color = Color::rgb(0.08, 0.085, 0.12);
+        }
+        let lifetime = r.gen::<f32>() * PARTICLE_LIFETIME;
+        Self {
+            color,
+            old_position: position.clone(),
+            position,
+            lifetime,
+            age: r.gen::<f32>() * lifetime,
+            updated: false,
+        }
     }
 }
 
@@ -101,7 +126,7 @@ struct VectorFieldState {
 impl VectorFieldState {
     fn new(ctx: &mut Context, image_tx: Sender<ImageData>) -> Self {
         Self {
-            particles: (0..N_PARTICLES).map(|_| Particle::random()).collect(),
+            particles: (0..N_PARTICLES).map(|n| Particle::random(0, n as u32)).collect(),
             circle: None,
             t: 0,
             canvas: Canvas::new(ctx, WIDTH as i32, HEIGHT as i32).unwrap(),
@@ -144,10 +169,9 @@ impl VectorFieldState {
                         }
 
                         let d = f(t, particle.position).norm_sqr();
-                        if particle.age >= particle.lifetime || d > 4.0 * SCALE * SCALE || d.is_nan() {
-                            particle = Particle::random();
+                        if !(particle.age >= particle.lifetime || d >= 4.0 * SCALE * SCALE || d.is_nan()) {
+                            task_buffer.push(particle);
                         }
-                        task_buffer.push(particle);
                     }
 
                     match res.lock() {
@@ -162,6 +186,9 @@ impl VectorFieldState {
 
         let res = res.into_inner().unwrap();
         self.particles = res;
+        for n in 0..PARTICLES_PER_FRAME {
+            self.particles.push(Particle::random(self.t as u32, n));
+        }
 
         // for particle in self.particles.iter_mut() {
         //     particle.updated = true;
@@ -182,7 +209,11 @@ impl VectorFieldState {
 }
 
 impl State for VectorFieldState {
-    fn update(&mut self, _ctx: &mut Context) -> tetra::Result {
+    fn update(&mut self, ctx: &mut Context) -> tetra::Result {
+        if LOOP_FRAMES > 1 && self.t > 2 * LOOP_FRAMES as usize {
+            println!("Rendering done!");
+            tetra::window::quit(ctx);
+        }
 
         Ok(())
     }
@@ -255,12 +286,12 @@ impl State for VectorFieldState {
         graphics::set_canvas(ctx, &self.canvas_blur);
         graphics::set_shader(ctx, &self.shader_blur);
         self.shader_blur.set_uniform(ctx, "u_stepsize", Vec2::new(1.0 / WIDTH as f32, 1.0 / HEIGHT as f32));
-        self.shader_blur.set_uniform(ctx, "u_horizontal", 1);
+        self.shader_blur.set_uniform(ctx, "u_horizontal", 1i32);
         self.canvas_bloom.draw(ctx, Vec2::zero());
 
         graphics::reset_canvas(ctx);
         graphics::set_canvas(ctx, &self.canvas_bloom);
-        self.shader_blur.set_uniform(ctx, "u_horizontal", 0);
+        self.shader_blur.set_uniform(ctx, "u_horizontal", 0i32);
         self.canvas_blur.draw(ctx, Vec2::zero());
 
         graphics::reset_shader(ctx);
@@ -271,7 +302,16 @@ impl State for VectorFieldState {
         self.canvas_bloom.draw(ctx, Vec2::zero());
 
         let image_data = self.canvas_bloom.get_data(ctx);
-        self.image_tx.send(image_data).unwrap();
+
+        if LOOP_FRAMES <= 1 {
+            // Print every frame
+            self.image_tx.send(image_data).unwrap();
+        } else {
+            // Only print [LOOP_FRAMES; 2*LOOP_FRAMES[, exit after that
+            if self.t >= LOOP_FRAMES as usize && self.t < 2 * LOOP_FRAMES as usize {
+                self.image_tx.send(image_data).unwrap();
+            }
+        }
 
         Ok(())
     }

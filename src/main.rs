@@ -9,30 +9,55 @@ use std::sync::mpsc::{Receiver, Sender, self};
 use std::sync::Mutex;
 use std::thread;
 
+// The number of units between the two nearest edges of the window
 const SCALE: f32 = 5.0;
+// The coordinates of the point at the center of the window
 const DX: f32 = -3.75;
 const DY: f32 = 0.0;
 
+// The maximum time that a particle may live for, in frames
 const PARTICLE_LIFETIME: f32 = 160.0;
+// The speed of the simulation: higher is faster but less accurate
 const EPSILON: f32 = 0.01;
+// The number of substeps to the simulation: does not affect particle speed but directly affects simulation accuracy and efficiency
 const SUBSTEPS: usize = 6;
-const NOISE: f32 = 0.5;
+// How long it takes for a particle to fade in (fed into a sigmoid function, so at PARTICLE_FADE_IN frames it'll have ~46% alpha)
 const PARTICLE_FADE_IN: f32 = 6.0;
+// How long it takes for a particle to fade out before it dies
 const PARTICLE_FADE_OUT: f32 = 6.0;
-const N_PARTICLES: usize = 100000;
 
-const POINT_SIZE: f32 = 0.5;
-const WIDTH: u32 = 1920 * 1;
-const HEIGHT: u32 = 1080 * 1;
-const SAVING: bool = true;
-const THREADS: u32 = 16;
-const TASK_SIZE: usize = 1000;
+// The number of initial particles
+const INITIAL_PARTICLES: usize = 40000;
+// The number of particles to spawn each frame
+const PARTICLES_PER_FRAME: u32 = 1000;
 
-const LOOP_FRAMES: u32 = 1; // Set to 1 for infinite animation, set to some other value for a looping animation
-const PARTICLES_PER_FRAME: u32 = 10000;
+// Whether to draw circles around the particle head and tail, very expensive
+const ROUND_PARTICLES: bool = false;
+// Diameter of a particle, in pixels
+const PARTICLE_SIZE: f32 = 2.0;
+
+// If true, only one update step will be done for each frame (bypassing tetra's physics/rendering separation)
+const ANIMATION_MODE: bool = false;
+// If true, frames will be saved to the disk
+const SAVING: bool = false;
+
+// The width of the window
+const WIDTH: u32 = 1920;
+// The height of the window
+const HEIGHT: u32 = 1080;
+
+// The number of threads to run the simulation on
+const THREADS: u32 = 8;
+// The number of particles for each "task batch"
+const TASK_SIZE: usize = 512;
+// Set to 1 for infinite animation, set to some other value for a looping animation
+const LOOP_FRAMES: u32 = 1;
 
 type Complex = num::complex::Complex<f32>;
 
+/**
+    The complex function from which the vector field is derived.
+**/
 fn f(_t: usize, mut x: Complex) -> Complex {
     for i in 2..12 {
         x += x.powi(i) * Complex::new(-i as f32, 0.0).exp();
@@ -40,14 +65,16 @@ fn f(_t: usize, mut x: Complex) -> Complex {
     x
 }
 
-#[allow(dead_code)]
-fn noise() -> Complex {
-    Complex::new(
-        (rand::random::<f32>() * 2.0 - 1.0) * NOISE,
-        (rand::random::<f32>() * 2.0 - 1.0) * NOISE,
-    )
+/**
+    Sigmoid function, mapped to [-1, 1]
+**/
+fn sigmoid(x: f32) -> f32 {
+    2.0 / (1.0 + (-x).exp()) - 1.0
 }
 
+/**
+    A single particle: it has a color, stores its current position and the position at its last render, alongside its lifetime and age.
+**/
 #[derive(Clone, Copy, Debug)]
 struct Particle {
     color: Color,
@@ -58,34 +85,16 @@ struct Particle {
     updated: bool,
 }
 
-fn sigmoid(x: f32) -> f32 {
-    2.0 / (1.0 + (-x).exp()) - 1.0
-}
-
 impl Particle {
-    fn new(position: Complex) -> Self {
-        let p = f(0, position);
-        let mut color = Color::rgb(0.8 + 0.2 * rand::random::<f32>() * sigmoid(p.norm()), 0.45 + 0.2 * rand::random::<f32>() * sigmoid(-p.im), 0.23);
-        if rand::random::<f32>() < 0.3 {
-            color = Color::rgb(0.08, 0.085, 0.12);
-        }
-        // let lifetime = LOOP_FRAMES as f32 / (if rand::random::<f32>() < 0.3 {4.0f32} else {8.0f32}).ceil();
-        let lifetime = rand::random::<f32>() * PARTICLE_LIFETIME;
-        Self {
-            color,
-            old_position: position.clone(),
-            position,
-            lifetime,
-            age: rand::random::<f32>() * lifetime,
-            updated: false,
-        }
-    }
-
-    fn random(mut t: u32, n: u32) -> Self {
+    /**
+        Creates a new particle from the given timestep and particle ID.
+        These parameters are then used to randomly generate the particle's parameters.
+    **/
+    fn new(mut t: u32, n: u32) -> Self {
         if LOOP_FRAMES > 1 {
             t %= LOOP_FRAMES;
         }
-        let seed: u64 = ((t as u64) << 32) | n as u64;
+        let seed: u64 = (((t as u64) << 32) | n as u64) ^ 0xCBF52D44320FD62A; // Append t to n and XOR them with a "nothing up my sleeve" number
         let mut r = rand::rngs::StdRng::seed_from_u64(seed);
         let position = Complex::new(
             (r.gen::<f32>() * 3.0 - 1.5) * SCALE * WIDTH.max(HEIGHT) as f32 / WIDTH as f32 + DX,
@@ -108,6 +117,9 @@ impl Particle {
     }
 }
 
+/**
+    The animation: contains a set of particles that is concurrently updated, and a set of canvases and shaders to compute the bloom.
+**/
 struct VectorFieldState {
     particles: Vec<Particle>,
 
@@ -126,7 +138,7 @@ struct VectorFieldState {
 impl VectorFieldState {
     fn new(ctx: &mut Context, image_tx: Sender<ImageData>) -> Self {
         Self {
-            particles: (0..N_PARTICLES).map(|n| Particle::random(0, n as u32)).collect(),
+            particles: (0..INITIAL_PARTICLES).map(|n| Particle::new(0, n as u32)).collect(),
             circle: None,
             t: 0,
             canvas: Canvas::new(ctx, WIDTH as i32, HEIGHT as i32).unwrap(),
@@ -139,6 +151,9 @@ impl VectorFieldState {
         }
     }
 
+    /**
+        Concurrently calculates the new particles' positions.
+    **/
     fn update_particles(&mut self) {
         let mut pool = Pool::new(THREADS);
 
@@ -150,7 +165,7 @@ impl VectorFieldState {
             let particles = &self.particles;
             for n in 0..(particles.len() / TASK_SIZE) {
                 let t = self.t;
-                scope.execute(move || { // move task_buffer
+                scope.execute(move || { // move [task_buffer, &res, n, o]
                     let n = n * TASK_SIZE;
                     let mut task_buffer = Vec::with_capacity(TASK_SIZE);
                     for o in n..(n+TASK_SIZE) {
@@ -164,7 +179,7 @@ impl VectorFieldState {
 
                         for _ in 0..SUBSTEPS {
                             let mut z = f(t, particle.position);
-                            z = z / z.norm(); // + noise();
+                            z = z / z.norm();
                             particle.position += z * (EPSILON / SUBSTEPS as f32);
                         }
 
@@ -187,24 +202,8 @@ impl VectorFieldState {
         let res = res.into_inner().unwrap();
         self.particles = res;
         for n in 0..PARTICLES_PER_FRAME {
-            self.particles.push(Particle::random(self.t as u32, n));
+            self.particles.push(Particle::new(self.t as u32, n));
         }
-
-        // for particle in self.particles.iter_mut() {
-        //     particle.updated = true;
-        //     particle.age += 1.0;
-
-        //     for _ in 0..SUBSTEPS {
-        //         let mut z = f(self.t, particle.position);
-        //         z = z / z.norm(); // + noise();
-        //         particle.position += z * (EPSILON / SUBSTEPS as f32);
-        //     }
-
-        //     let d = f(self.t, particle.position).norm_sqr();
-        //     if particle.age >= particle.lifetime || d > 4.0 * SCALE * SCALE || d.is_nan() {
-        //         *particle = Particle::random();
-        //     }
-        // }
     }
 }
 
@@ -215,14 +214,21 @@ impl State for VectorFieldState {
             tetra::window::quit(ctx);
         }
 
+        if !ANIMATION_MODE {
+            self.update_particles();
+            self.t += 1;
+        }
+
         Ok(())
     }
 
     fn draw(&mut self, ctx: &mut Context) -> tetra::Result {
-        self.update_particles();
-        self.t += 1;
+        if ANIMATION_MODE {
+            self.update_particles();
+            self.t += 1;
+        }
         if self.circle.is_none() {
-            self.circle = Some(Mesh::circle(ctx, ShapeStyle::Fill, Vec2::new(0.0, 0.0), POINT_SIZE)?);
+            self.circle = Some(Mesh::circle(ctx, ShapeStyle::Fill, Vec2::new(0.0, 0.0), PARTICLE_SIZE * 0.5)?);
         }
         let circle = self.circle.as_ref().unwrap();
         let background = Color::rgb(0.08, 0.085, 0.12);
@@ -255,17 +261,20 @@ impl State for VectorFieldState {
             let old_y = ((particle.old_position.im - DY) / SCALE / 2.0 + 0.5) * wh as f32 + dy;
             particle.old_position = particle.position;
 
-            let mut params: DrawParams = Vec2::new(x, y).into();
-            let s = sigmoid(particle.age / PARTICLE_FADE_IN) * sigmoid((particle.lifetime - particle.age) / PARTICLE_FADE_OUT);
-            // params.color = particle.color.with_alpha(s);
-            // circle.draw(ctx, params.clone());
-            // params.position = Vec2::new(old_x, old_y);
-            // circle.draw(ctx, params);
+            let alpha = sigmoid(particle.age / PARTICLE_FADE_IN) * sigmoid((particle.lifetime - particle.age) / PARTICLE_FADE_OUT);
+
+            if ROUND_PARTICLES {
+                let mut params: DrawParams = Vec2::new(x, y).into();
+                params.color = particle.color.with_alpha(alpha);
+                circle.draw(ctx, params.clone());
+                params.position = Vec2::new(old_x, old_y);
+                circle.draw(ctx, params);
+            }
 
             let line = [Vec2::new(x, y), Vec2::new(old_x, old_y)];
 
-            builder.set_color(particle.color.with_alpha(s));
-            builder.polyline(POINT_SIZE * 2.0, &line)?;
+            builder.set_color(particle.color.with_alpha(alpha));
+            builder.polyline(PARTICLE_SIZE, &line)?;
         }
 
         let mesh = builder.build_mesh(ctx)?;
@@ -303,13 +312,15 @@ impl State for VectorFieldState {
 
         let image_data = self.canvas_bloom.get_data(ctx);
 
-        if LOOP_FRAMES <= 1 {
-            // Print every frame
-            self.image_tx.send(image_data).unwrap();
-        } else {
-            // Only print [LOOP_FRAMES; 2*LOOP_FRAMES[, exit after that
-            if self.t >= LOOP_FRAMES as usize && self.t < 2 * LOOP_FRAMES as usize {
+        if SAVING {
+            if LOOP_FRAMES <= 1 {
+                // Print every frame
                 self.image_tx.send(image_data).unwrap();
+            } else {
+                // Only print [LOOP_FRAMES; 2*LOOP_FRAMES[, exit after that
+                if self.t >= LOOP_FRAMES as usize && self.t < 2 * LOOP_FRAMES as usize {
+                    self.image_tx.send(image_data).unwrap();
+                }
             }
         }
 
@@ -320,17 +331,18 @@ impl State for VectorFieldState {
 fn main() -> tetra::Result {
     let (tx, rx): (Sender<ImageData>, Receiver<ImageData>) = mpsc::channel();
 
-    thread::spawn(move || {
-        let mut n: usize = 0;
-        for image_data in rx {
-            n += 1;
-            let width = image_data.width() as u32;
-            let height = image_data.height() as u32;
-            let buffer: RgbaImage = RgbaImage::from_raw(width, height, image_data.into_bytes()).unwrap();
-            if SAVING {
+    if SAVING {
+        thread::spawn(move || {
+            let mut n: usize = 0;
+            for image_data in rx {
+                n += 1;
+                let width = image_data.width() as u32;
+                let height = image_data.height() as u32;
+                let buffer: RgbaImage = RgbaImage::from_raw(width, height, image_data.into_bytes()).unwrap();
+
                 buffer.save(format!("output/{}.png", n)).unwrap();
             }
-        }
-    });
+        });
+    }
     ContextBuilder::new("Vector Fields", WIDTH as i32, HEIGHT as i32).build()?.run(|ctx| Ok(VectorFieldState::new(ctx, tx)))
 }

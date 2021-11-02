@@ -3,6 +3,8 @@
 A visualization of vector fields in Rust using Tetra.
 Spawns and renders a bunch of particles on the screen.
 
+[See a rendered version here!](https://odysee.com/@ShadAmethyst:9/vector-field-fractal-perfect-hd:2) ([SD version](https://odysee.com/@ShadAmethyst:9/vector-field-fractal-perfect-sd:7))
+
 ## Installation and running
 
 Clone this repository, then navigate into it and run the code:
